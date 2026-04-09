@@ -8,6 +8,7 @@ from runtime_agent import (
     invoke_agent,
     invoke_agent_async,
     invoke_agent_detailed,
+    invoke_agent_streaming_detailed,
     is_transient_failure_response,
     run_due_tasks_async,
     trigger_task_now,
@@ -26,7 +27,7 @@ from runtime_config import (
     SEARCH_TIMEOUT_SECONDS,
     STATE_FILE,
 )
-from runtime_prompt import SYSTEM_PROMPT
+from runtime_prompt import CHAT_SYSTEM_PROMPT, EXECUTOR_SYSTEM_PROMPT, SYSTEM_PROMPT
 from runtime_schedule import (
     DAY_TO_CRON,
     get_next_run_utc,
@@ -53,6 +54,8 @@ __all__ = [
     "SEARCH_MAX_RETRIES",
     "SEARCH_TIMEOUT_SECONDS",
     "STATE_FILE",
+    "CHAT_SYSTEM_PROMPT",
+    "EXECUTOR_SYSTEM_PROMPT",
     "SYSTEM_PROMPT",
     "StateStore",
     "build_tools",
@@ -64,6 +67,7 @@ __all__ = [
     "invoke_agent",
     "invoke_agent_async",
     "invoke_agent_detailed",
+    "invoke_agent_streaming_detailed",
     "is_transient_failure_response",
     "iso_to_dt",
     "parse_hhmm",

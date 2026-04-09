@@ -19,6 +19,10 @@ foreach ($proc in $existing) {
 
 Start-Sleep -Milliseconds 600
 
+# Force UTF-8 stream encoding for verbose debug output on Windows.
+$env:PYTHONIOENCODING = "utf-8"
+$env:PYTHONUTF8 = "1"
+
 # Start detached.
 Start-Process `
     -FilePath $pythonExe `

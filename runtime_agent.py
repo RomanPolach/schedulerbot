@@ -5,6 +5,7 @@ import json
 import os
 import threading
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -12,19 +13,25 @@ from typing import Any, Dict, List
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from langchain.agents import create_agent
 from langchain_core.messages import SystemMessage
-from langchain_xai import ChatXAI
 
 from runtime_config import (
+    AGENT_GRAPH_DEBUG,
     FAILED_TASK_RETRY_SECONDS,
+    GEMINI_INCLUDE_THOUGHTS,
+    GEMINI_THINKING_BUDGET,
+    GEMINI_THINKING_LEVEL,
     MODEL_MAX_RETRIES,
-    MODEL_TEMPERATURE,
     MODEL_TIMEOUT_SECONDS,
     SCHEDULED_TASK_TIMEOUT_SECONDS,
     SCHEDULER_MISFIRE_GRACE_SECONDS,
     STATE_FILE,
 )
-from runtime_middleware import limit_human_ai_history_middleware
-from runtime_prompt import SYSTEM_PROMPT
+from runtime_middleware import (
+    create_agent_trace_middleware,
+    create_tool_call_limit_middleware,
+    limit_human_ai_history_middleware,
+)
+from runtime_prompt import CHAT_SYSTEM_PROMPT, EXECUTOR_SYSTEM_PROMPT
 from runtime_store import StateStore
 from runtime_tools import build_tools
 
@@ -39,7 +46,7 @@ _ASSISTANT_MESSAGE_TYPES = {"AIMessage", "AssistantMessage"}
 @dataclass
 class AgentRuntime:
     agent: Any
-    scheduler_agent: Any
+    executor_agent: Any
     store: StateStore
     scheduler: AsyncIOScheduler
     scheduler_loop: asyncio.AbstractEventLoop
@@ -145,21 +152,6 @@ def _start_scheduler_event_loop() -> tuple[asyncio.AbstractEventLoop, threading.
     return loop, thread
 
 
-def _create_xai_model(model_name: str, xai_api_key: str, xai_base_url: str) -> ChatXAI:
-    model_temperature = max(0.0, min(float(os.getenv("MODEL_TEMPERATURE", str(MODEL_TEMPERATURE))), 2.0))
-    model_timeout = max(10.0, min(float(os.getenv("MODEL_TIMEOUT_SECONDS", str(MODEL_TIMEOUT_SECONDS))), 300.0))
-    model_retries = max(0, min(int(os.getenv("MODEL_MAX_RETRIES", str(MODEL_MAX_RETRIES))), 5))
-    return ChatXAI(
-        model=model_name,
-        api_key=xai_api_key,
-        xai_api_base=xai_base_url,
-        temperature=model_temperature,
-        timeout=model_timeout,
-        max_retries=model_retries,
-        use_responses_api=True,
-    )
-
-
 def _create_gemini_model(model_name: str) -> Any:
     google_api_key = (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY") or "").strip()
     if not google_api_key:
@@ -170,7 +162,7 @@ def _create_gemini_model(model_name: str) -> Any:
         from langchain_google_genai import ChatGoogleGenerativeAI
     except Exception as exc:
         raise RuntimeError("Missing dependency for Gemini. Install `langchain-google-genai`.") from exc
-    model_temperature = max(0.0, min(float(os.getenv("MODEL_TEMPERATURE", str(MODEL_TEMPERATURE))), 2.0))
+    model_temperature = 1.0
     model_timeout = max(10.0, min(float(os.getenv("MODEL_TIMEOUT_SECONDS", str(MODEL_TIMEOUT_SECONDS))), 300.0))
     model_retries = max(0, min(int(os.getenv("MODEL_MAX_RETRIES", str(MODEL_MAX_RETRIES))), 5))
     return ChatGoogleGenerativeAI(
@@ -179,19 +171,53 @@ def _create_gemini_model(model_name: str) -> Any:
         temperature=model_temperature,
         timeout=model_timeout,
         max_retries=model_retries,
+        include_thoughts=GEMINI_INCLUDE_THOUGHTS,
+        thinking_level=GEMINI_THINKING_LEVEL,
+        thinking_budget=GEMINI_THINKING_BUDGET,
+    )
+
+
+def _create_openrouter_model(model_name: str) -> Any:
+    openrouter_api_key = (os.getenv("OPENROUTER_API_KEY") or "").strip()
+    if not openrouter_api_key:
+        raise RuntimeError("Missing API key. Set OPENROUTER_API_KEY.")
+    try:
+        from langchain_openai import ChatOpenAI
+    except Exception as exc:
+        raise RuntimeError("Missing dependency for OpenRouter compatibility mode. Install `langchain-openai`.") from exc
+    model_temperature = 1.0
+    model_timeout = max(10.0, min(float(os.getenv("MODEL_TIMEOUT_SECONDS", str(MODEL_TIMEOUT_SECONDS))), 300.0))
+    model_retries = max(0, min(int(os.getenv("MODEL_MAX_RETRIES", str(MODEL_MAX_RETRIES))), 5))
+    return ChatOpenAI(
+        model=model_name,
+        api_key=openrouter_api_key,
+        base_url="https://openrouter.ai/api/v1",
+        temperature=model_temperature,
+        timeout=model_timeout,
+        max_retries=model_retries,
+        extra_body={
+            "provider": {
+                "only": ["fireworks"],
+                "allow_fallbacks": False,
+            }
+        },
     )
 
 
 def _emit_scheduled_task_event(
     store: StateStore,
     task_id: str,
+    task_title: str,
     message: str,
     tool_calls: List[Dict[str, Any]],
+    status: str,
 ) -> None:
     store.add_event(
         {
             "type": "scheduled_task_result",
             "task_id": task_id,
+            "task_title": task_title,
+            "status": status,
             "message": message,
             "tool_calls": tool_calls,
         }
@@ -205,6 +231,14 @@ async def _run_single_due_task_async(
     should_retry = False
     is_once_task = (task_type or "").lower() == "once"
     tool_calls: List[Dict[str, Any]] = []
+    task_title = task_id
+    try:
+        task = next((item for item in store.list_tasks() if item.get("id") == task_id), None)
+        raw_title = " ".join(str((task or {}).get("title", "")).split()).strip()
+        if raw_title:
+            task_title = raw_title
+    except Exception:
+        task_title = task_id
     try:
         detailed = await asyncio.wait_for(
             invoke_agent_async_detailed(
@@ -245,7 +279,14 @@ async def _run_single_due_task_async(
                     f"{response}\n\n"
                     "One-time task will not be retried automatically."
                 )
-            _emit_scheduled_task_event(store, task_id, response, tool_calls)
+            _emit_scheduled_task_event(
+                store,
+                task_id,
+                task_title,
+                response,
+                tool_calls,
+                status="failed_no_retry" if should_retry else "completed",
+            )
             return
 
         if should_retry:
@@ -259,11 +300,25 @@ async def _run_single_due_task_async(
                 f"{response}\n\n"
                 f"Retry scheduled in {FAILED_TASK_RETRY_SECONDS} seconds because this run failed."
             )
-            _emit_scheduled_task_event(store, task_id, retry_msg, tool_calls)
+            _emit_scheduled_task_event(
+                store,
+                task_id,
+                task_title,
+                retry_msg,
+                tool_calls,
+                status="retry_scheduled",
+            )
             return
 
         store.mark_task_run(task_id=task_id, result=response, now_utc=now_utc)
-        _emit_scheduled_task_event(store, task_id, response, tool_calls)
+        _emit_scheduled_task_event(
+            store,
+            task_id,
+            task_title,
+            response,
+            tool_calls,
+            status="completed",
+        )
     except Exception:
         # Keep scheduler loop resilient even if state write fails unexpectedly.
         traceback.print_exc(limit=2)
@@ -272,38 +327,40 @@ async def _run_single_due_task_async(
 def create_runtime(model_name: str) -> AgentRuntime:
     store = StateStore(STATE_FILE)
     tools = build_tools(store)
-    scheduler_tools = [
+    executor_tools = [
         tool
         for tool in tools
         if getattr(tool, "name", "")
         not in {"schedule_task", "list_scheduled_tasks", "remove_scheduled_task"}
     ]
 
-    provider = (os.getenv("MODEL_PROVIDER", "xai") or "").strip().lower()
-    if provider in {"xai", "grok"}:
-        xai_api_key = os.getenv("XAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        if not xai_api_key:
-            raise RuntimeError("Missing API key. Set XAI_API_KEY (or OPENAI_API_KEY).")
-        xai_base_url = os.getenv("XAI_BASE_URL", "https://api.x.ai/v1")
-        llm = _create_xai_model(model_name, xai_api_key, xai_base_url)
-        scheduler_llm = _create_xai_model(model_name, xai_api_key, xai_base_url)
-    elif provider in {"gemini", "google"}:
-        llm = _create_gemini_model(model_name)
-        scheduler_llm = _create_gemini_model(model_name)
-    else:
-        raise RuntimeError("Unsupported MODEL_PROVIDER. Use 'xai' or 'gemini'.")
+    llm = _create_gemini_model(model_name)
+    executor_llm = _create_gemini_model(model_name)
+    # llm = _create_openrouter_model(model_name)
+    # executor_llm = _create_openrouter_model(model_name)
 
     agent = create_agent(
         model=llm,
         tools=tools,
-        system_prompt=SYSTEM_PROMPT,
-        middleware=[limit_human_ai_history_middleware],
+        system_prompt=CHAT_SYSTEM_PROMPT,
+        middleware=[
+            limit_human_ai_history_middleware,
+            create_tool_call_limit_middleware(),
+            create_agent_trace_middleware("chat-agent"),
+        ],
+        debug=AGENT_GRAPH_DEBUG,
+        name="chat-agent",
     )
-    scheduler_agent = create_agent(
-        model=scheduler_llm,
-        tools=scheduler_tools,
-        system_prompt=SYSTEM_PROMPT,
-        middleware=[limit_human_ai_history_middleware],
+    executor_agent = create_agent(
+        model=executor_llm,
+        tools=executor_tools,
+        system_prompt=EXECUTOR_SYSTEM_PROMPT,
+        middleware=[
+            create_tool_call_limit_middleware(),
+            create_agent_trace_middleware("executor-agent"),
+        ],
+        debug=AGENT_GRAPH_DEBUG,
+        name="executor-agent",
     )
 
     scheduler_loop, scheduler_thread = _start_scheduler_event_loop()
@@ -314,7 +371,7 @@ def create_runtime(model_name: str) -> AgentRuntime:
         run_due_tasks_async,
         "interval",
         seconds=poll_seconds,
-        kwargs={"agent": scheduler_agent, "store": store},
+        kwargs={"agent": executor_agent, "store": store},
         id="due-task-runner",
         max_instances=1,
         coalesce=True,
@@ -324,7 +381,7 @@ def create_runtime(model_name: str) -> AgentRuntime:
         run_due_tasks_async,
         "date",
         run_date=datetime.now(timezone.utc),
-        kwargs={"agent": scheduler_agent, "store": store},
+        kwargs={"agent": executor_agent, "store": store},
         id="due-task-startup-runner",
         replace_existing=True,
         misfire_grace_time=SCHEDULER_MISFIRE_GRACE_SECONDS,
@@ -333,7 +390,7 @@ def create_runtime(model_name: str) -> AgentRuntime:
 
     return AgentRuntime(
         agent=agent,
-        scheduler_agent=scheduler_agent,
+        executor_agent=executor_agent,
         store=store,
         scheduler=scheduler,
         scheduler_loop=scheduler_loop,
@@ -431,27 +488,77 @@ def _build_invoke_details(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def invoke_agent_detailed(agent: Any, messages: List[Dict[str, str]]) -> Dict[str, Any]:
+def invoke_agent_detailed(agent: Any, messages: List[Any]) -> Dict[str, Any]:
     with _get_agent_lock(agent):
         result = agent.invoke({"messages": _with_runtime_context(messages)})
     return _build_invoke_details(result)
 
 
-def invoke_agent(agent: Any, messages: List[Dict[str, str]]) -> str:
+def invoke_agent_streaming_detailed(
+    agent: Any,
+    messages: List[Any],
+    on_text: Callable[[str], None] | None = None,
+) -> Dict[str, Any]:
+    latest_values: Dict[str, Any] | None = None
+    active_message_id = ""
+    active_text = ""
+
+    with _get_agent_lock(agent):
+        for mode, payload in agent.stream(
+            {"messages": _with_runtime_context(messages)},
+            stream_mode=["messages", "values"],
+        ):
+            if mode == "values":
+                if isinstance(payload, dict):
+                    latest_values = payload
+                continue
+
+            if mode != "messages" or not isinstance(payload, tuple) or len(payload) != 2:
+                continue
+
+            chunk, metadata = payload
+            if not isinstance(metadata, dict) or metadata.get("langgraph_node") != "model":
+                continue
+
+            chunk_id = str(getattr(chunk, "id", "") or "")
+            if chunk_id and chunk_id != active_message_id:
+                active_message_id = chunk_id
+                active_text = ""
+
+            delta_text = content_to_text(getattr(chunk, "content", ""))
+            if not delta_text:
+                continue
+
+            active_text += delta_text
+            if on_text is not None:
+                on_text(active_text)
+
+    if latest_values is None:
+        raise RuntimeError("Agent stream completed without a final state payload.")
+
+    detailed = _build_invoke_details(latest_values)
+    final_text = detailed["text"]
+    if on_text is not None and final_text and final_text != active_text:
+        on_text(final_text)
+    return detailed
+
+
+def invoke_agent(agent: Any, messages: List[Any]) -> str:
     return invoke_agent_detailed(agent, messages)["text"]
 
 
-async def invoke_agent_async(agent: Any, messages: List[Dict[str, str]]) -> str:
+async def invoke_agent_async(agent: Any, messages: List[Any]) -> str:
     return (await invoke_agent_async_detailed(agent, messages))["text"]
 
 
-async def invoke_agent_async_detailed(agent: Any, messages: List[Dict[str, str]]) -> Dict[str, Any]:
-    result = await agent.ainvoke({"messages": _with_runtime_context(messages)})
-    return _build_invoke_details(result)
+async def invoke_agent_async_detailed(agent: Any, messages: List[Any]) -> Dict[str, Any]:
+    # Keep async scheduler flow non-blocking while using sync invoke underneath.
+    # This avoids provider/tool stacks that fail in ainvoke() contexts.
+    return await asyncio.to_thread(invoke_agent_detailed, agent, messages)
 
 
 def trigger_task_now(
-    scheduler_agent: Any,
+    executor_agent: Any,
     store: StateStore,
     scheduler_loop: asyncio.AbstractEventLoop,
     task_id: str,
@@ -472,7 +579,7 @@ def trigger_task_now(
 
     future = asyncio.run_coroutine_threadsafe(
         _run_single_due_task_async(
-            agent=scheduler_agent,
+            agent=executor_agent,
             store=store,
             task_id=task_id,
             task_prompt=task_prompt,

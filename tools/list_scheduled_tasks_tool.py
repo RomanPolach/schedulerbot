@@ -10,9 +10,18 @@ from runtime_store import StateStore, format_task_table
 def create_list_scheduled_tasks_tool(store: StateStore) -> Any:
     @tool
     def list_scheduled_tasks() -> str:
-        """List all currently scheduled tasks."""
+        """List all scheduled tasks.
+
+        Required args:
+        - none
+
+        Returns:
+        - one task per line with id, title, status, schedule, next run, timezone, and task prompt.
+
+        Example:
+        - list_scheduled_tasks()
+        """
         tasks = store.list_tasks()
         return format_task_table(tasks)
 
     return list_scheduled_tasks
-

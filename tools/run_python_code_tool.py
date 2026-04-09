@@ -13,7 +13,21 @@ from tools.shared_shell import python_runner_candidates
 def create_run_python_code_tool() -> Any:
     @tool
     def run_python_code(code: str, timeout_seconds: int = 30) -> str:
-        """Run Python code safely via a temporary .py file (no CMD quoting needed)."""
+        """Run Python code from a temporary script file.
+
+        Required args:
+        - code: Python source code to execute.
+
+        Optional args:
+        - timeout_seconds: hard timeout in seconds (1..180).
+
+        Returns:
+        - interpreter used, exit code, stdout, and stderr (or timeout message with partial output).
+
+        Examples:
+        - run_python_code(code="print('hello')")
+        - run_python_code(code="import sys; print(sys.version)", timeout_seconds=20)
+        """
         snippet = (code or "").strip()
         if not snippet:
             return "No Python code provided."
@@ -97,4 +111,3 @@ def create_run_python_code_tool() -> Any:
                     pass
 
     return run_python_code
-

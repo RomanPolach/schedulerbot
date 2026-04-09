@@ -56,6 +56,7 @@ def format_task_table(tasks: List[Dict[str, Any]]) -> str:
             " | ".join(
                 [
                     f"id={task['id']}",
+                    f"title={task.get('title', '-')}",
                     f"status={status}",
                     f"schedule={task['schedule_text']}",
                     f"next_run={next_run_local}",
@@ -88,12 +89,31 @@ class StateStore:
                 self._write_state(state)
 
     @staticmethod
+    def _fallback_task_title(task: Dict[str, Any]) -> str:
+        task_id = str(task.get("id", "")).strip()
+        if task_id:
+            return f"Legacy task {task_id}"
+        return "Legacy task"
+
+    @staticmethod
     def _normalize_state(state: Dict[str, Any]) -> Dict[str, Any]:
         state.setdefault("tasks", [])
         state.setdefault("events", [])
         state.setdefault("next_event_id", 1)
         state.setdefault("chat_messages", [])
         state.setdefault("processed_event_id", 0)
+        normalized_tasks: List[Dict[str, Any]] = []
+        for task in state.get("tasks", []):
+            if not isinstance(task, dict):
+                continue
+            normalized_task = dict(task)
+            title = " ".join(str(normalized_task.get("title", "")).split()).strip()
+            if not title:
+                normalized_task["title"] = StateStore._fallback_task_title(normalized_task)
+            else:
+                normalized_task["title"] = title
+            normalized_tasks.append(normalized_task)
+        state["tasks"] = normalized_tasks
         return state
 
     def _read_state(self) -> Dict[str, Any]:
@@ -105,12 +125,17 @@ class StateStore:
         with self.file_path.open("w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
 
-    def add_task(self, task_prompt: str, schedule_text: str, timezone_name: str) -> Dict[str, Any]:
+    def add_task(self, title: str, task_prompt: str, schedule_text: str, timezone_name: str) -> Dict[str, Any]:
+        clean_title = " ".join((title or "").split()).strip()
+        if not clean_title:
+            raise ValueError("Task title cannot be empty.")
+
         tz = ZoneInfo(timezone_name)
         schedule_meta = parse_schedule_definition(schedule_text, tz)
 
         task = {
             "id": str(uuid.uuid4())[:8],
+            "title": clean_title,
             "task_prompt": task_prompt,
             "schedule_text": schedule_text,
             "task_type": schedule_meta["task_type"],
@@ -258,6 +283,7 @@ class StateStore:
         content: str,
         tool_calls: List[Dict[str, Any]] | None = None,
         message_type: str | None = None,
+        extra_fields: Dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             state = self._read_state()
@@ -266,6 +292,10 @@ class StateStore:
                 message["tool_calls"] = tool_calls
             if message_type:
                 message["message_type"] = str(message_type)
+            if isinstance(extra_fields, dict):
+                for key, value in extra_fields.items():
+                    if value is not None:
+                        message[str(key)] = value
             state["chat_messages"].append(message)
             # Keep a bounded chat history to prevent unbounded state growth.
             state["chat_messages"] = state["chat_messages"][-MAX_CHAT_MESSAGES:]

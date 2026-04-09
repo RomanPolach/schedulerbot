@@ -20,6 +20,7 @@ from playwright.async_api import async_playwright
 from runtime_config import MAX_SITE_CONTENT_CHARS
 
 _EVENT_LOOP_POLICY_LOCK = threading.Lock()
+_INLINE_URL_AT_END_RE = re.compile(r"\((https?://[^()\s]+)\)$")
 
 
 def _parse_reuse_browser_enabled() -> bool:
@@ -45,6 +46,42 @@ def _resolve_max_concurrency() -> int:
 
 def _resolve_warmup_timeout_seconds() -> float:
     return max(5.0, min(float(os.getenv("PLAYWRIGHT_STARTUP_TIMEOUT_SECONDS", "30")), 120.0))
+
+
+def _looks_like_low_value_tail_line(line: str) -> bool:
+    text = " ".join((line or "").split()).strip()
+    if not text:
+        return True
+
+    lowered = text.lower()
+    if lowered in {"o nás", "blog", "cookies", "kontakt", "osobní údaje", "pro média"}:
+        return True
+
+    match = _INLINE_URL_AT_END_RE.search(text)
+    if match:
+        label = text[: match.start()].strip()
+        parsed = urlparse(match.group(1))
+        depth = len([segment for segment in parsed.path.split("/") if segment])
+        return len(label) <= 40 or (len(label) <= 60 and depth <= 1)
+
+    return len(text) <= 60
+
+
+def _trim_low_value_tail_lines(text: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if len(lines) < 4:
+        return "\n".join(lines)
+
+    trimmed = list(lines)
+    removed = 0
+    while trimmed and _looks_like_low_value_tail_line(trimmed[-1]):
+        trimmed.pop()
+        removed += 1
+
+    # Avoid stripping a legitimate short ending line unless it is clearly a footer cluster.
+    if removed < 3:
+        return "\n".join(lines)
+    return "\n".join(trimmed)
 
 
 class _PlaywrightBrowserService:
@@ -132,6 +169,16 @@ class _PlaywrightBrowserService:
             raise RuntimeError("Shared Playwright browser context initialization failed.")
         return self._context
 
+    async def new_isolated_context(self) -> BrowserContext:
+        if self._browser is None:
+            await self.ensure_browser_context()
+        if self._browser is None:
+            raise RuntimeError("Shared Playwright browser initialization failed.")
+        return await self._browser.new_context(
+            user_agent=self._user_agent,
+            ignore_https_errors=True,
+        )
+
     async def reset_browser_context(self) -> BrowserContext:
         await self._close_resources()
         await self._initialize_resources()
@@ -199,6 +246,7 @@ class _PlaywrightBrowserService:
 
 _BROWSER_SERVICE = _PlaywrightBrowserService()
 atexit.register(_BROWSER_SERVICE.shutdown)
+_SHARED_PARSE_SESSION_LOCK = threading.Lock()
 
 
 def _run_function_in_thread(func: Any, *args: Any, **kwargs: Any) -> Any:
@@ -249,95 +297,247 @@ async def _parse_single_website_with_playwright(
         try:
             await page.goto(normalized, wait_until="networkidle", timeout=timeout_ms)
         except PlaywrightTimeoutError:
-            return (
-                f"URL: {normalized}\n"
-                f"Error: Timeout while waiting for full page load (networkidle) "
-                f"within {timeout_ms} ms."
-            )
+            # Some pages keep background requests open after the usable content is visible.
+            # Continue with the DOM that already loaded instead of discarding the page.
+            if page.url == "about:blank":
+                return (
+                    f"URL: {normalized}\n"
+                    f"Error: Timeout while waiting for page load within {timeout_ms} ms."
+                )
 
         if render_wait_ms:
             await page.wait_for_timeout(render_wait_ms)
 
         final_url = page.url
         title = (await page.title()) or "(no title)"
-        body_text = await page.inner_text("body")
-        text = " ".join(body_text.split())
+        extraction = await page.evaluate(
+            """() => {
+                const normalize = (value) => (value || '').replace(/\\s+/g, ' ').trim();
+                const blockTags = new Set([
+                    'article', 'section', 'div', 'p', 'li', 'ul', 'ol', 'table', 'tr',
+                    'td', 'th', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'main', 'body',
+                    'header', 'footer', 'nav', 'aside', 'br'
+                ]);
 
-        text = text[:content_limit]
+                const isHidden = (el) => {
+                    if (!(el instanceof Element)) {
+                        return false;
+                    }
+                    if (el.hidden || el.getAttribute('aria-hidden') === 'true') {
+                        return true;
+                    }
+                    const style = window.getComputedStyle(el);
+                    return style.display === 'none' || style.visibility === 'hidden';
+                };
 
-        link_rows = await page.eval_on_selector_all(
-            "main a[href], article a[href], [role='main'] a[href]",
-            """els => els.map(e => ({
-                href: e.href || e.getAttribute('href') || '',
-                text: (e.innerText || '').trim()
-            }))""",
+                const shouldDropElement = (el) => {
+                    if (!(el instanceof Element)) {
+                        return false;
+                    }
+                    const tag = el.tagName.toLowerCase();
+                    return ['script', 'style', 'noscript', 'svg', 'canvas', 'iframe'].includes(tag);
+                };
+
+                const root = document.body;
+                let keptLinks = 0;
+
+                const escapeTableCell = (value) => normalize(value).replace(/[|]/g, '\\\\|');
+
+                const renderTable = (table) => {
+                    const rowSelector = table.tagName.toLowerCase() === 'table'
+                        ? ':scope > thead > tr, :scope > tbody > tr, :scope > tfoot > tr, :scope > tr'
+                        : ':scope > [role="row"], :scope [role="row"]';
+                    const cellSelector = 'th, td, [role="columnheader"], [role="rowheader"], [role="cell"]';
+                    const spanValue = (cell, propertyName, attributeName) => {
+                        const parsed = Number.parseInt(cell[propertyName] || cell.getAttribute(attributeName) || '1', 10);
+                        if (!Number.isFinite(parsed) || parsed < 1) {
+                            return 1;
+                        }
+                        return Math.min(parsed, 50);
+                    };
+                    const sourceRows = Array.from(table.querySelectorAll(rowSelector))
+                        .map((row) => {
+                            const cells = Array.from(row.querySelectorAll(cellSelector))
+                                .filter((cell) => cell.closest('tr, [role="row"]') === row)
+                                .map((cell) => {
+                                    const rendered = Array.from(cell.childNodes)
+                                        .map((child) => renderNode(child))
+                                        .filter(Boolean)
+                                        .join(' ');
+                                    return {
+                                        text: escapeTableCell(rendered || cell.innerText || cell.textContent || ''),
+                                        colSpan: spanValue(cell, 'colSpan', 'colspan'),
+                                        rowSpan: spanValue(cell, 'rowSpan', 'rowspan')
+                                    };
+                                });
+                            return {
+                                cells,
+                                isHeader: cells.length > 0 && Array.from(row.children).some((cell) => {
+                                    const tag = cell.tagName.toLowerCase();
+                                    const role = cell.getAttribute('role');
+                                    return tag === 'th' || role === 'columnheader' || role === 'rowheader';
+                                })
+                            };
+                        })
+                        .filter((row) => row.cells.length > 0);
+
+                    const activeRowSpans = [];
+                    const rows = sourceRows.map((row) => {
+                        const cells = [];
+                        let column = 0;
+
+                        const applyActiveRowSpan = () => {
+                            while (activeRowSpans[column] && activeRowSpans[column].remainingRows > 0) {
+                                const span = activeRowSpans[column];
+                                cells[column] = span.text;
+                                span.remainingRows -= 1;
+                                if (span.remainingRows <= 0) {
+                                    activeRowSpans[column] = undefined;
+                                }
+                                column += 1;
+                            }
+                        };
+
+                        applyActiveRowSpan();
+                        for (const cell of row.cells) {
+                            applyActiveRowSpan();
+                            for (let offset = 0; offset < cell.colSpan; offset += 1) {
+                                const targetColumn = column + offset;
+                                const text = offset === 0 ? cell.text : '';
+                                cells[targetColumn] = text;
+                                if (cell.rowSpan > 1) {
+                                    activeRowSpans[targetColumn] = {
+                                        text,
+                                        remainingRows: cell.rowSpan - 1
+                                    };
+                                }
+                            }
+                            column += cell.colSpan;
+                        }
+
+                        while (column < activeRowSpans.length) {
+                            applyActiveRowSpan();
+                            column += 1;
+                        }
+
+                        return {
+                            cells,
+                            isHeader: row.isHeader
+                        };
+                    });
+
+                    if (!rows.length) {
+                        return '';
+                    }
+
+                    const maxColumns = Math.max(...rows.map((row) => row.cells.length));
+                    if (!maxColumns) {
+                        return '';
+                    }
+
+                    const normalizedRows = rows.map((row) => ({
+                        ...row,
+                        cells: row.cells.concat(Array(Math.max(0, maxColumns - row.cells.length)).fill(''))
+                    }));
+                    const hasHeader = normalizedRows[0].isHeader;
+                    const output = [];
+
+                    for (let index = 0; index < normalizedRows.length; index += 1) {
+                        const row = normalizedRows[index];
+                        output.push(`| ${row.cells.join(' | ')} |`);
+                        if (index === 0 && hasHeader) {
+                            output.push(`| ${Array(maxColumns).fill('---').join(' | ')} |`);
+                        }
+                    }
+
+                    return '\\n' + output.join('\\n') + '\\n';
+                };
+
+                const renderNode = (node) => {
+                    if (!node) {
+                        return '';
+                    }
+
+                    if (node.nodeType === Node.TEXT_NODE) {
+                        return normalize(node.textContent || '');
+                    }
+
+                    if (!(node instanceof Element)) {
+                        return '';
+                    }
+
+                    if (isHidden(node) || shouldDropElement(node)) {
+                        return '';
+                    }
+
+                    const tag = node.tagName.toLowerCase();
+                    if (tag === 'a') {
+                        const href = normalize(node.href || node.getAttribute('href') || '');
+                        const label = normalize(node.innerText || node.textContent || '');
+                        if (!href) {
+                            return label;
+                        }
+                        keptLinks += 1;
+                        return label ? `${label} (${href})` : `(${href})`;
+                    }
+
+                    const role = node.getAttribute('role');
+                    if (tag === 'table' || role === 'table' || role === 'grid') {
+                        return renderTable(node);
+                    }
+
+                    if (tag === 'br') {
+                        return '\\n';
+                    }
+
+                    const parts = [];
+                    for (const child of Array.from(node.childNodes)) {
+                        const rendered = renderNode(child);
+                        if (rendered) {
+                            parts.push(rendered);
+                        }
+                    }
+
+                    const joined = parts.join(blockTags.has(tag) ? '\\n' : ' ');
+                    const cleaned = joined
+                        .replace(/[ \\t]*\\n[ \\t]*/g, '\\n')
+                        .replace(/\\n{3,}/g, '\\n\\n')
+                        .replace(/[ \\t]{2,}/g, ' ')
+                        .trim();
+
+                    if (!cleaned) {
+                        return '';
+                    }
+
+                    return blockTags.has(tag) ? `\\n${cleaned}\\n` : cleaned;
+                };
+
+                const rawLines = renderNode(root)
+                    .split(/\\n+/)
+                    .map((line) => normalize(line))
+                    .filter(Boolean);
+
+                const lines = [];
+                for (const line of rawLines) {
+                    if (!lines.length || lines[lines.length - 1] !== line) {
+                        lines.push(line);
+                    }
+                }
+
+                return {
+                    content: lines.join('\\n'),
+                    kept_links: keptLinks
+                };
+            }"""
         )
-        if not link_rows:
-            link_rows = await page.eval_on_selector_all(
-                "a[href]",
-                """els => els.map(e => ({
-                    href: e.href || e.getAttribute('href') || '',
-                    text: (e.innerText || '').trim()
-                }))""",
-            )
+        text = str((extraction or {}).get("content", "")).strip()
+        if len(text) > content_limit:
+            text = f"{text[:content_limit].rstrip()}..."
 
-        by_href: Dict[str, str] = {}
-        for row in link_rows:
-            href = str((row or {}).get("href", "")).strip()
-            label = " ".join(str((row or {}).get("text", "")).split())
-            if not href:
-                continue
-            lowered_href = href.lower()
-            if lowered_href.startswith(("javascript:", "mailto:", "tel:")):
-                continue
-            if not href.startswith(("http://", "https://")):
-                continue
-            if len(label) < 6:
-                continue
-            current = by_href.get(href, "")
-            if len(label) > len(current):
-                by_href[href] = label
+        if not text:
+            text = "(no text extracted)"
 
-        base_domain = urlparse(final_url).netloc.lower()
-        scored_links = []
-        for href, label in by_href.items():
-            parsed = urlparse(href)
-            score = 0
-            if parsed.netloc.lower() == base_domain:
-                score += 2
-            if 20 <= len(label) <= 160:
-                score += 1
-            if parsed.fragment:
-                score -= 2
-            if len(parsed.query) > 160:
-                score -= 1
-            lowered = label.lower()
-            if any(
-                bad in lowered
-                for bad in [
-                    "cookie",
-                    "privacy",
-                    "terms",
-                    "login",
-                    "sign in",
-                    "newsletter",
-                    "facebook",
-                    "instagram",
-                    "linkedin",
-                ]
-            ):
-                score -= 2
-            scored_links.append((score, href, label))
-        scored_links.sort(key=lambda x: x[0], reverse=True)
-
-        links_block = ""
-        if scored_links:
-            lines = ["Detected page links:"]
-            for idx, (_, href, label) in enumerate(scored_links[:20], start=1):
-                lines.append(f"{idx}. {label or '(no title)'} | {href}")
-            links_block = "\n" + "\n".join(lines)
-
-        return f"URL: {final_url}\nTitle: {title}\nContent: {text or '(no text extracted)'}{links_block}"
+        return f"URL: {final_url}\nTitle: {title}\nContent:\n{text}"
     except Exception as exc:
         return f"URL: {normalized}\nError: {type(exc).__name__}: {exc!r}"
     finally:
@@ -348,7 +548,7 @@ async def _parse_single_website_with_playwright(
 
 
 async def _parse_websites_with_playwright_async(
-    context: BrowserContext,
+    create_context: Any,
     items: List[str],
     content_limit: int,
     timeout_ms: int,
@@ -360,14 +560,21 @@ async def _parse_websites_with_playwright_async(
 
     async def _worker(index: int, target_url: str) -> tuple[int, str]:
         async with semaphore:
-            chunk = await _parse_single_website_with_playwright(
-                context=context,
-                url=target_url,
-                content_limit=content_limit,
-                timeout_ms=timeout_ms,
-                render_wait_ms=render_wait_ms,
-            )
-            return index, chunk
+            context = await create_context()
+            try:
+                chunk = await _parse_single_website_with_playwright(
+                    context=context,
+                    url=target_url,
+                    content_limit=content_limit,
+                    timeout_ms=timeout_ms,
+                    render_wait_ms=render_wait_ms,
+                )
+                return index, chunk
+            finally:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
 
     results = await asyncio.gather(*[_worker(i, target) for i, target in enumerate(targets)])
     results.sort(key=lambda x: x[0])
@@ -383,10 +590,12 @@ async def _parse_websites_with_playwright_ephemeral_async(
 ) -> List[str]:
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context(ignore_https_errors=True)
         try:
+            async def _create_context() -> BrowserContext:
+                return await browser.new_context(ignore_https_errors=True)
+
             return await _parse_websites_with_playwright_async(
-                context=context,
+                create_context=_create_context,
                 items=items,
                 content_limit=content_limit,
                 timeout_ms=timeout_ms,
@@ -394,7 +603,6 @@ async def _parse_websites_with_playwright_ephemeral_async(
                 max_concurrency=max_concurrency,
             )
         finally:
-            await context.close()
             await browser.close()
 
 
@@ -406,41 +614,49 @@ def _parse_websites_with_shared_browser(
     max_concurrency: int,
 ) -> str:
     timeout_seconds = max(10.0, min(float(timeout_ms) / 1000.0 + 30.0, 300.0))
-    context = _BROWSER_SERVICE.run(
-        _BROWSER_SERVICE.ensure_browser_context(),
-        timeout_seconds=timeout_seconds,
-    )
-    try:
-        chunks = _BROWSER_SERVICE.run(
-            _parse_websites_with_playwright_async(
-                context=context,
-                items=items,
-                content_limit=content_limit,
-                timeout_ms=timeout_ms,
-                render_wait_ms=render_wait_ms,
-                max_concurrency=max_concurrency,
-            ),
+    with _SHARED_PARSE_SESSION_LOCK:
+        # Ensure the shared browser process is healthy before creating per-page
+        # isolated contexts for this parse request.
+        _BROWSER_SERVICE.run(
+            _BROWSER_SERVICE.ensure_browser_context(),
             timeout_seconds=timeout_seconds,
         )
-    except Exception:
-        # Browser/context can occasionally become invalid after crashes or OOM.
-        # Recreate once and retry this parse request.
-        context = _BROWSER_SERVICE.run(
-            _BROWSER_SERVICE.reset_browser_context(),
-            timeout_seconds=timeout_seconds,
-        )
-        chunks = _BROWSER_SERVICE.run(
-            _parse_websites_with_playwright_async(
-                context=context,
-                items=items,
-                content_limit=content_limit,
-                timeout_ms=timeout_ms,
-                render_wait_ms=render_wait_ms,
-                max_concurrency=max_concurrency,
-            ),
-            timeout_seconds=timeout_seconds,
-        )
-    return "\n\n".join(chunks)
+        try:
+            async def _create_context() -> BrowserContext:
+                return await _BROWSER_SERVICE.new_isolated_context()
+
+            chunks = _BROWSER_SERVICE.run(
+                _parse_websites_with_playwright_async(
+                    create_context=_create_context,
+                    items=items,
+                    content_limit=content_limit,
+                    timeout_ms=timeout_ms,
+                    render_wait_ms=render_wait_ms,
+                    max_concurrency=max_concurrency,
+                ),
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception:
+            # Browser/context can occasionally become invalid after crashes or OOM.
+            # Recreate once and retry this parse request from clean per-page contexts.
+            _BROWSER_SERVICE.run(
+                _BROWSER_SERVICE.reset_browser_context(),
+                timeout_seconds=timeout_seconds,
+            )
+            async def _create_context() -> BrowserContext:
+                return await _BROWSER_SERVICE.new_isolated_context()
+            chunks = _BROWSER_SERVICE.run(
+                _parse_websites_with_playwright_async(
+                    create_context=_create_context,
+                    items=items,
+                    content_limit=content_limit,
+                    timeout_ms=timeout_ms,
+                    render_wait_ms=render_wait_ms,
+                    max_concurrency=max_concurrency,
+                ),
+                timeout_seconds=timeout_seconds,
+            )
+        return "\n\n".join(chunks)
 
 
 def _parse_websites_with_ephemeral_browser(
@@ -476,9 +692,24 @@ def warmup_parse_websites_browser() -> str:
 def create_parse_websites_tool() -> Any:
     @tool
     def parse_websites(urls: str, max_chars_per_site: int = MAX_SITE_CONTENT_CHARS) -> str:
-        """Fetch and parse a comma/newline-separated list of URLs, returning title and extracted text.
+        """Fetch and parse web pages from multiple URLs.
 
-        Content is truncated only if it exceeds ~10 A4 pages (MAX_SITE_CONTENT_CHARS).
+        Required args:
+        - urls: comma-separated or newline-separated URL list.
+
+        Optional args:
+        - max_chars_per_site: max extracted characters per site (clamped to configured global limit).
+
+        Returns:
+        - per-URL block containing final URL, page title, and extracted text with kept links inline.
+
+        Notes:
+        - maximum 10 URLs per call.
+        - pages may be partially loaded or truncated on timeout/size limits.
+
+        Examples:
+        - parse_websites(urls="https://example.com, https://news.ycombinator.com")
+        - parse_websites(urls="https://example.com\\nhttps://another.com", max_chars_per_site=12000)
         """
         raw_items = re.split(r"[\n,]+", urls)
         items = [u.strip() for u in raw_items if u.strip()]

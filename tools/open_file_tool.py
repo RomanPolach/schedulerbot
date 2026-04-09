@@ -287,7 +287,21 @@ def _read_ods_markdown(file_path: str) -> tuple[str, bool]:
 def create_open_file_tool() -> Any:
     @tool
     def open_file(file_path: str) -> str:
-        """Read a supported local file and return content as markdown text."""
+        """Read a supported local file and return markdown content.
+
+        Required args:
+        - file_path: absolute or relative path to a local file.
+
+        Supported file types:
+        - .txt, .csv, .docx, .docm, .xlsx, .xlsm, .odt, .ods, .odp
+
+        Notes:
+        - output may be truncated by configured size/row/column limits.
+
+        Examples:
+        - open_file(file_path="data/report.txt")
+        - open_file(file_path="C:\\\\docs\\\\notes.docx")
+        """
         raw = strip_wrapping_quotes((file_path or "").strip())
         if not raw:
             return "No file path provided."
@@ -330,4 +344,3 @@ def create_open_file_tool() -> Any:
         return _format_markdown_file_output(resolved, file_type, body_md, truncated=truncated)
 
     return open_file
-

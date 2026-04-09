@@ -13,7 +13,21 @@ from tools.shared_shell import parse_python_c_command
 def create_run_windows_cmd_tool() -> Any:
     @tool
     def run_windows_cmd(command: str, timeout_seconds: int = 25) -> str:
-        """Run a Windows CMD command (cmd /c) and return stdout/stderr."""
+        """Run a Windows command and return stdout/stderr.
+
+        Required args:
+        - command: command string executed via cmd /c.
+
+        Optional args:
+        - timeout_seconds: hard timeout in seconds (1..120).
+
+        Returns:
+        - exit code, stdout, and stderr (or timeout message with partial output).
+
+        Examples:
+        - run_windows_cmd(command="dir C:\\\\")
+        - run_windows_cmd(command="git status", timeout_seconds=15)
+        """
         timeout_seconds = max(1, min(timeout_seconds, 120))
         sanitized_command = re.sub(r"\|\s*(more|less)(\s+.*)?$", "", command, flags=re.IGNORECASE).strip()
         command_to_run = sanitized_command or command
@@ -77,4 +91,3 @@ def create_run_windows_cmd_tool() -> Any:
             return f"Command error: {exc}"
 
     return run_windows_cmd
-
