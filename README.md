@@ -1,5 +1,7 @@
 ﻿# Schedule Chatbot (LangChain v1 Agent + Streamlit)
 
+![Schedule Assistant UI](docs/schedule-assistant-ui.png)
+
 This project implements a **reactive + proactive** chatbot:
 
 - Reactive: answers normal chat questions.

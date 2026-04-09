@@ -562,15 +562,22 @@ def trigger_task_now(
     store: StateStore,
     scheduler_loop: asyncio.AbstractEventLoop,
     task_id: str,
-) -> str:
+) -> Dict[str, Any]:
     tasks = store.list_tasks()
     task = next((item for item in tasks if item.get("id") == task_id), None)
     if not task:
-        return f"Task {task_id} not found."
+        return {"started": False, "task_id": task_id, "message": f"Task {task_id} not found."}
+
+    task_title = " ".join(str(task.get("title", "")).split()).strip() or task_id
 
     task_prompt = str(task.get("task_prompt", "")).strip()
     if not task_prompt:
-        return f"Task {task_id} has empty task prompt; run was not started."
+        return {
+            "started": False,
+            "task_id": task_id,
+            "task_title": task_title,
+            "message": f'Task "{task_title}" has no text, so it was not started.',
+        }
 
     task_type = str(task.get("task_type", "recurring") or "recurring")
     if task_type.lower() == "once":
@@ -588,5 +595,15 @@ def trigger_task_now(
         scheduler_loop,
     )
     if future.cancelled():
-        return f"Manual run for task {task_id} was cancelled before start."
-    return f"Manual run started for task {task_id}."
+        return {
+            "started": False,
+            "task_id": task_id,
+            "task_title": task_title,
+            "message": f'Running task "{task_title}" manually was cancelled before it started.',
+        }
+    return {
+        "started": True,
+        "task_id": task_id,
+        "task_title": task_title,
+        "message": f'Running task "{task_title}" manually...',
+    }
