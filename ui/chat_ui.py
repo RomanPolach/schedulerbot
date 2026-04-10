@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 from html import escape
@@ -71,10 +71,10 @@ def scheduled_result_status_text(message: dict[str, Any]) -> str:
     status = str(message.get("scheduled_status", "") or "").strip().lower()
     created_at_text = format_event_timestamp(message.get("scheduled_created_at"))
     if status == "retry_scheduled":
-        return f"Retry planned • {created_at_text}"
+        return f"Retry planned - {created_at_text}"
     if status == "failed_no_retry":
-        return f"Failed, no retry • {created_at_text}"
-    return f"Completed • {created_at_text}"
+        return f"Failed, no retry - {created_at_text}"
+    return f"Completed - {created_at_text}"
 
 
 def render_scheduled_result_message(message: dict[str, Any], index: int) -> None:
@@ -95,16 +95,17 @@ def render_scheduled_result_message(message: dict[str, Any], index: int) -> None
     label_parts.append(status_text)
     expander_label = " | ".join(part for part in label_parts if part)
     container_state = "unread" if is_unread else "read"
+    key_suffix = f"{scheduled_event_id}_{index}"
 
-    with st.container(border=False, key=f"scheduled_result_{container_state}_{scheduled_event_id}"):
+    with st.container(border=False, key=f"scheduled_result_{container_state}_{key_suffix}"):
         with st.expander(expander_label, expanded=False):
             meta_bits = []
             task_id = str(message.get("task_id", "") or "").strip()
             if task_id:
                 meta_bits.append(f"Task ID: `{task_id}`")
             meta_bits.append(status_text)
-            st.caption(" • ".join(meta_bits))
-            if is_unread and st.button("Mark as read", key=f"mark_scheduled_read_{scheduled_event_id}"):
+            st.caption(" - ".join(meta_bits))
+            if is_unread and st.button("Mark as read", key=f"mark_scheduled_read_{key_suffix}"):
                 unread_ids.discard(scheduled_event_id)
                 st.rerun()
             st.markdown(str(message.get("content", "") or ""))

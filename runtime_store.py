@@ -114,6 +114,20 @@ class StateStore:
                 normalized_task["title"] = title
             normalized_tasks.append(normalized_task)
         state["tasks"] = normalized_tasks
+        normalized_messages: List[Dict[str, Any]] = []
+        seen_scheduled_event_ids: set[str] = set()
+        for message in state.get("chat_messages", []):
+            if not isinstance(message, dict):
+                continue
+            normalized_message = dict(message)
+            message_type = str(normalized_message.get("message_type", "")).strip().lower()
+            scheduled_event_id = str(normalized_message.get("scheduled_event_id", "")).strip()
+            if message_type == "scheduled" and scheduled_event_id:
+                if scheduled_event_id in seen_scheduled_event_ids:
+                    continue
+                seen_scheduled_event_ids.add(scheduled_event_id)
+            normalized_messages.append(normalized_message)
+        state["chat_messages"] = normalized_messages[-MAX_CHAT_MESSAGES:]
         return state
 
     def _read_state(self) -> Dict[str, Any]:
@@ -296,6 +310,16 @@ class StateStore:
                 for key, value in extra_fields.items():
                     if value is not None:
                         message[str(key)] = value
+            if str(message.get("message_type", "")).strip().lower() == "scheduled":
+                scheduled_event_id = str(message.get("scheduled_event_id", "")).strip()
+                if scheduled_event_id:
+                    for existing in state.get("chat_messages", []):
+                        if not isinstance(existing, dict):
+                            continue
+                        existing_type = str(existing.get("message_type", "")).strip().lower()
+                        existing_event_id = str(existing.get("scheduled_event_id", "")).strip()
+                        if existing_type == "scheduled" and existing_event_id == scheduled_event_id:
+                            return
             state["chat_messages"].append(message)
             # Keep a bounded chat history to prevent unbounded state growth.
             state["chat_messages"] = state["chat_messages"][-MAX_CHAT_MESSAGES:]

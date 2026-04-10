@@ -25,6 +25,9 @@ APP_CSS = """
 [data-testid="stChatMessage"] [data-testid="stChatMessageContent"] {
     align-self: center;
 }
+[data-testid="stBottomBlockContainer"] {
+    padding-right: 7.2rem;
+}
 [data-testid="stExpander"] details {
     border-radius: 10px;
 }
@@ -298,22 +301,38 @@ div[class*="st-key-task_prompt_draft_"] textarea {
     color: #10233b;
     line-height: 1.35;
 }
-div[class*="st-key-clear_conversation_"] button {
-    border-radius: 10px;
-    border: 1px solid #cfd9e7;
-    background: rgba(255, 255, 255, 0.82);
-    color: #28415f;
-    min-height: 2.2rem;
-    padding: 0.18rem 0.85rem;
-    font-weight: 600;
-    box-shadow: 0 8px 18px -18px #1f2937;
+div[class*="st-key-clear_chat_bottom_shell"] {
+    position: fixed;
+    right: 1rem;
+    bottom: 3.35rem;
+    z-index: 1000;
+    width: 5.4rem;
 }
-div[class*="st-key-clear_conversation_"] button:hover {
-    border-color: #b8c9df;
-    background: #f7fbff;
-    color: #18314d;
+div[class*="st-key-clear_chat_main_"] button {
+    border-radius: 10px;
+    border: 1px solid #b9cff5;
+    background: linear-gradient(180deg, #eaf3ff 0%, #dceafe 100%);
+    color: #214b90;
+    min-height: 2.55rem;
+    padding: 0.18rem 0.7rem;
+    font-weight: 700;
+    box-shadow: 0 10px 20px -18px #1f2937;
+    white-space: nowrap;
+}
+div[class*="st-key-clear_chat_main_"] button:hover {
+    border-color: #9ebcf0;
+    background: linear-gradient(180deg, #deecff 0%, #cfdef8 100%);
+    color: #173e7c;
 }
 @media (max-width: 768px) {
+    [data-testid="stBottomBlockContainer"] {
+        padding-right: 6.1rem;
+    }
+    div[class*="st-key-clear_chat_bottom_shell"] {
+        right: 0.65rem;
+        bottom: 2.85rem;
+        width: 4.7rem;
+    }
     div[class*="st-key-taskcard_"] {
         padding: 0.58rem 0.62rem 0.54rem;
         margin-bottom: 0.54rem;

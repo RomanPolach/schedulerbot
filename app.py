@@ -99,6 +99,11 @@ trim_session_histories()
 
 if "last_event_id" not in st.session_state:
     st.session_state.last_event_id = runtime.store.get_processed_event_id()
+else:
+    # Keep each browser session in sync with the globally processed event cursor.
+    persisted_processed_event_id = runtime.store.get_processed_event_id()
+    if persisted_processed_event_id > st.session_state.last_event_id:
+        st.session_state.last_event_id = persisted_processed_event_id
 
 if "unread_scheduled_result_ids" not in st.session_state:
     st.session_state.unread_scheduled_result_ids = set()
@@ -111,15 +116,6 @@ header_placeholder = st.empty()
 render_page_header(header_placeholder, EMPTY_CHAT_SUBTITLE, bool(st.session_state.messages))
 
 with st.sidebar:
-    with st.container(border=False, key="clear_conversation_shell"):
-        button_col, _ = st.columns([0.85, 2.15])
-        with button_col:
-            if st.button("Clear chat", key="clear_conversation_button", type="secondary"):
-                runtime.store.clear_chat_messages()
-                st.session_state.messages = []
-                st.session_state.agent_messages = []
-                st.rerun()
-
     st.subheader("Scheduled Tasks")
 
     tasks = runtime.store.list_tasks()
@@ -150,11 +146,21 @@ should_auto_refresh = bool(tasks or st.session_state.manual_run_statuses)
 
 
 new_events = runtime.store.get_events_after(st.session_state.last_event_id)
+known_scheduled_event_ids = {
+    str(message.get("scheduled_event_id", "")).strip()
+    for message in st.session_state.messages
+    if isinstance(message, dict)
+    and str(message.get("message_type", "")).strip().lower() == "scheduled"
+    and str(message.get("scheduled_event_id", "")).strip()
+}
 for event in new_events:
     if event.get("type") != "scheduled_task_result":
         continue
 
     scheduled_event_id = str(event.get("id", ""))
+    if scheduled_event_id in known_scheduled_event_ids:
+        continue
+
     result_text = str(event.get("message", "") or "")
     task_title = " ".join(str(event.get("task_title", "")).split()).strip()
     scheduled_message = {
@@ -178,6 +184,7 @@ for event in new_events:
             "task_title": scheduled_message["task_title"],
         },
     )
+    known_scheduled_event_ids.add(scheduled_event_id)
     st.session_state.manual_run_statuses.pop(str(event.get("task_id", "")), None)
     st.session_state.unread_scheduled_result_ids.add(scheduled_event_id)
     send_windows_os_alert(
@@ -205,8 +212,14 @@ for index, message in enumerate(st.session_state.messages):
             if should_render_tool_calls(message):
                 render_tool_calls_panel(message.get("tool_calls"))
 
+prompt = st.chat_input("Message...", key="main_chat_input")
+with st.container(border=False, key="clear_chat_bottom_shell"):
+    if st.button("Clear", key="clear_chat_main_button", type="secondary", use_container_width=True):
+        runtime.store.clear_chat_messages()
+        st.session_state.messages = []
+        st.session_state.agent_messages = []
+        st.rerun()
 
-prompt = st.chat_input("Message...")
 if prompt:
     append_message({"role": "user", "content": prompt})
 
