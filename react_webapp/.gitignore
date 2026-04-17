@@ -1,0 +1,16 @@
+# Local runtime state
+data/
+
+# Runtime/dev logs
+*.log
+backend*.log
+frontend*.log
+
+# Frontend build/deps/cache
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/node_modules/.vite/
+
+# Local frontend runtime artifacts
+frontend/data/

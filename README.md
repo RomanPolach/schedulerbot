@@ -9,6 +9,37 @@ This project implements a **reactive + proactive** chatbot:
 
 It uses **LangChain v1.0 agent API** (`create_agent`) and a Streamlit chat UI.
 
+## Alternative UI: React Webapp
+
+A separate React frontend + FastAPI backend is available in:
+
+- `react_webapp/`
+
+This keeps Streamlit as backup while giving a smoother client-side UI for large chat histories.
+The React backend now uses its own local runtime/tool modules inside `react_webapp/`, so it can run as an isolated unit.
+See:
+
+- `react_webapp/README.md`
+
+Quick run (single terminal):
+
+```powershell
+cd react_webapp\frontend
+npm install
+npm run dev:all
+```
+
+### React Webapp Preview
+
+![Schedulebot React Webapp](react_webapp/assets/schedulebot-reactive.png)
+
+React webapp highlights:
+
+- Smooth client-side chat with collapsible scheduled-result cards
+- Streaming assistant responses in normal conversation
+- Task grouping (`Today / Yesterday / Future`) with task operations in sidebar
+- Standalone backend runtime isolated under `react_webapp/`
+
 ## Features
 
 - LangChain v1 agent with tool-calling.
@@ -64,13 +95,17 @@ Optional env vars:
 - `TAVILY_TOPIC` (default: `general`, options: `general|news|finance`)
 - `TAVILY_INCLUDE_DOMAINS` (optional CSV list of domains)
 - `TAVILY_EXCLUDE_DOMAINS` (optional CSV list of domains)
-- `AUTO_REFRESH_MS` (default: `30000`)
+- `EVENT_POLL_MS` (default: `500`, event polling interval for scheduled-task updates)
+- `SUPPRESS_WINDOWS_ALERT_WHEN_UI_ACTIVE` (default: `true`, skip Windows alert when chatbot page is actively refreshing)
+- `UI_ACTIVE_WINDOW_SECONDS` (default: `8`, heartbeat window used to decide if UI is active)
 - `SCHEDULER_POLL_SECONDS` (default: `60`)
 - `PLAYWRIGHT_REUSE_BROWSER` (default: `true`, keeps Chromium alive and reuses it)
 - `PLAYWRIGHT_STARTUP_TIMEOUT_SECONDS` (default: `30`, startup warmup timeout)
 - `PLAYWRIGHT_MAX_CONCURRENCY` (default: `4`, range `1..8` for `parse_websites`)
-- `PLAYWRIGHT_RENDER_WAIT_MS` (default: `350`, extra wait after navigation)
-- `PLAYWRIGHT_PAGE_TIMEOUT_SECONDS` (default: `30`, per-page timeout)
+- `PLAYWRIGHT_RENDER_WAIT_MS` (default: `120`, extra wait after navigation)
+- `PLAYWRIGHT_PAGE_TIMEOUT_SECONDS` (default: `15`, per-page timeout)
+- `PLAYWRIGHT_WAIT_UNTIL` (default: `domcontentloaded`, options: `commit|domcontentloaded|load|networkidle`)
+- `PLAYWRIGHT_BLOCK_RESOURCE_TYPES` (default: `image,media,font`, CSV resource types to skip while loading)
 - `AGENT_TRACE_ENABLED` (default: `true`, enables local agent tracing to file)
 - `AGENT_TRACE_FILE` (default: `data/agent_trace.log`)
 - `AGENT_TRACE_FORMAT` (default: `pretty`, options: `pretty|jsonl`)

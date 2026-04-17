@@ -1,0 +1,24 @@
+{
+  "name": "schedule-chatbot-react",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "dev:all": "kill-port 8000 5173 && concurrently -k -n API,UI -c yellow,cyan \"py -3 -m uvicorn react_webapp.backend_api:app --app-dir ../.. --host 127.0.0.1 --port 8000 --reload\" \"vite\"",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-markdown": "^10.1.0",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-react": "^4.3.1",
+    "concurrently": "^9.2.1",
+    "kill-port": "^2.0.1",
+    "vite": "^5.4.10"
+  }
+}
